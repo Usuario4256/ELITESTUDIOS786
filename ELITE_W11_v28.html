@@ -5279,19 +5279,14 @@ function cSelectAll(){
 async function cDeleteSelected(){
   if(!cSelFiles.size){toast('err','⚠️ No hay archivos seleccionados');return;}
   const n=cSelFiles.size;
-  if(!confirm(`¿Eliminar ${n} archivo(s) seleccionado(s)?`))return;
+  if(!confirm(`¿Eliminar permanentemente ${n} archivo(s)? Esta acción no se puede deshacer.`))return;
   const ids=[...cSelFiles];
   cSelFiles.clear();
   cUpdateSelUI();
-  for(const id of ids){
-    const idx=cloudFiles.findIndex(x=>x.id===id);
-    if(idx!==-1)cloudFiles[idx].trash=true;
-    const el=document.querySelector(`[data-id="${id}"]`);
-    if(el)el.remove();
-    cTrashFile(id);
-  }
+  ids.forEach(id=>{const el=document.querySelector(`[data-id="${id}"]`);if(el)el.remove();});
+  for(const id of ids) await cDeleteFile(id);
   cRender();cUpdateStats();
-  toast('ok',`🗑️ ${n} archivo(s) eliminado(s)`);
+  toast('ok',`🗑️ ${n} archivo(s) eliminado(s) permanentemente`);
 }
 function cNewFolder(){
   const n=prompt('Nombre de la carpeta en la nube:');
