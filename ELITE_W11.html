@@ -1015,7 +1015,15 @@ onAuthStateChanged(auth, (user) => {
     const u = { name: user.displayName || user.email.split('@')[0], email: user.email, uid: user.uid, gmail: user.providerData[0]?.providerId === 'google.com' };
     if (typeof authSaveSession === 'function') authSaveSession(u);
     if (typeof updateUserUI   === 'function') updateUserUI(u);
-    if (typeof fbLoadCloudFiles === 'function') fbLoadCloudFiles();
+    // Cargar archivos de la nube — con reintento si cRender aún no existe
+    function _tryLoadCloud(attempts){
+      if(typeof fbLoadCloudFiles === 'function'){
+        fbLoadCloudFiles();
+      } else if(attempts > 0){
+        setTimeout(()=>_tryLoadCloud(attempts-1), 500);
+      }
+    }
+    _tryLoadCloud(10);
   } else {
     window._fbUser = null;
   }
@@ -5661,6 +5669,8 @@ function cRender(){
       if(isImg&&f.blob){
         if(!_thumbURLCache[f.id])_thumbURLCache[f.id]=URL.createObjectURL(f.blob);
         thumbUrl=_thumbURLCache[f.id];
+      } else if(isImg&&f.url){
+        thumbUrl=f.url;
       }
       const thumb=thumbUrl?`<img src="${thumbUrl}" style="width:100%;height:72px;object-fit:cover;border-radius:5px;margin-bottom:5px" loading="lazy">`:`<div style="font-size:38px;line-height:1;margin-bottom:5px;text-align:center">${ico}</div>`;
       return`<div class="cf${sel?' sel':''}" data-id="${f.id}" onclick="cSel('${f.id}',event)" ondblclick="cPrev(${i})" ontouchend="cTouchTap(this,${i},event)" oncontextmenu="cCtx(event,'${f.id}')">${thumb}<div class="cf-n">${escH(f.name)}</div><div class="cf-s">${fmtSize(f.size||0)}</div></div>`;
@@ -5686,6 +5696,10 @@ async function cInit(){
   await cInitDB();
   await cLoadAll();
   cRender();cUpdateStats();
+  // Si hay sesión Firebase, sincronizar desde la nube (dispositivo nuevo o recarga)
+  if(window._fb&&(window._fbUser||authGetSession())){
+    setTimeout(fbLoadCloudFiles, 300);
+  }
 }
 
 function cUpload(){$('cloud-inp').click();}
@@ -5781,7 +5795,9 @@ function cPrev(idx){
   cPrevIdx=idx;const f=cPrevFiles[idx];
   $('cp-ttl').textContent=f.name;$('cp-sz').textContent=fmtSize(f.size||0)+' · '+f.dateStr;
   $('cp-ico').textContent=cGetIcon(f);
-  const body=$('cp-body'),cat=cGetCat(f),url=f.blob?URL.createObjectURL(f.blob):null;
+  const body=$('cp-body'),cat=cGetCat(f);
+  // Usar blob local si existe, sino URL de Firebase
+  const url=f.blob?URL.createObjectURL(f.blob):(f.url||null);
   if(cat==='photos'&&url)body.innerHTML=`<img src="${url}" style="max-width:88vw;max-height:73vh;border-radius:8px;object-fit:contain" loading="lazy">`;
   else if(cat==='videos'&&url)body.innerHTML=`<video src="${url}" controls style="max-width:88vw;max-height:73vh;border-radius:8px;background:#000"></video>`;
   else if(cat==='music'&&url)body.innerHTML=`<div style="padding:32px;text-align:center;background:var(--p2);border-radius:10px;min-width:280px"><div style="font-size:64px;margin-bottom:14px">🎵</div><div style="font-size:15px;font-weight:600;margin-bottom:6px">${escH(f.name)}</div><div style="font-size:12px;color:var(--t3);margin-bottom:14px">${fmtSize(f.size||0)}</div><audio controls src="${url}" style="width:100%"></audio></div>`;
@@ -5794,10 +5810,18 @@ function cPrevNav(d){const n=cPrevIdx+d;if(n>=0&&n<cPrevFiles.length)cPrev(n);}
 function cDl(){if(window._cpFile)doDl(window._cpFile);}
 function cDlById(id,e){e&&(e.stopPropagation(),e.preventDefault());const f=cloudFiles.find(f=>f.id===id);if(f)doDl(f);}
 function doDl(f){
-  if(!f.blob){toast('err','❌ Archivo no disponible para descarga');return;}
-  const url=URL.createObjectURL(f.blob),a=document.createElement('a');
-  a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
-  toast('ok',`⬇️ Descargando ${f.name}`);
+  if(f.blob){
+    const url=URL.createObjectURL(f.blob),a=document.createElement('a');
+    a.href=url;a.download=f.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+    toast('ok',`⬇️ Descargando ${f.name}`);
+  } else if(f.url){
+    // Archivo de Firebase — abrir/descargar via URL directa
+    const a=document.createElement('a');
+    a.href=f.url;a.download=f.name;a.target='_blank';a.click();
+    toast('ok',`⬇️ Descargando ${f.name} desde la nube`);
+  } else {
+    toast('err','❌ Archivo no disponible para descarga');
+  }
 }
 function cShare(){if(window._cpFile)doShare(window._cpFile);}
 function cShareById(id,e){e&&(e.stopPropagation(),e.preventDefault());const f=cloudFiles.find(f=>f.id===id);if(f)doShare(f);}
@@ -6442,15 +6466,30 @@ async function fbUploadFile(file, onProgress){
 
 // Cargar archivos desde Firebase Storage/Firestore
 async function fbLoadCloudFiles(){
+  if(!window._fb)return;
+  // Usar Firebase user directamente (funciona en dispositivo nuevo aunque localStorage esté vacío)
+  const fbUser=window._fb.auth.currentUser||window._fbUser;
   const session=authGetSession();
-  if(!session||!window._fb)return;
-  const {db,collection,getDocs,query,where}=window._fb;
-  const uid=session.uid||btoa(session.email).replace(/=/g,'');
+  const uid=fbUser?fbUser.uid:(session?session.uid||btoa(session.email).replace(/=/g,''):null);
+  if(!uid)return;
+  // Si no hay sesión local pero hay usuario Firebase, guardarla
+  if(!session&&fbUser){
+    const u={name:fbUser.displayName||fbUser.email.split('@')[0],email:fbUser.email,uid:fbUser.uid};
+    if(typeof authSaveSession==='function')authSaveSession(u);
+    if(typeof updateUserUI==='function')updateUserUI(u);
+  }
+  const {db,collection,getDocs}=window._fb;
   try{
     const snap=await getDocs(collection(db,'users',uid,'files'));
     const fbFiles=[];
     snap.forEach(d=>{const data=d.data();if(!data.trash)fbFiles.push(data);});
-    // Merge con archivos locales (IndexedDB) evitando duplicados
+    if(fbFiles.length===0&&cloudFiles.length===0){
+      // No hay archivos en la nube ni locales — actualizar UI igual
+      cUpdateStats();
+      if(typeof cRender==='function')cRender();
+      return;
+    }
+    // Merge: Firebase tiene prioridad, luego archivos locales no subidos
     const fbIds=new Set(fbFiles.map(f=>f.id));
     const localOnly=cloudFiles.filter(f=>!fbIds.has(f.id)&&f.id.startsWith('cf_'));
     cloudFiles=[...fbFiles,...localOnly];
@@ -6490,11 +6529,32 @@ function fbSignOut(){
 }
 
 // syncData ahora usa Firebase + localStorage como fallback
+// Subir archivos locales (IndexedDB, sin sesión) a Firebase al iniciar sesión
+async function fbUploadLocalFiles(){
+  if(!window._fb||!window._fbUser)return;
+  const localFiles=cloudFiles.filter(f=>!f.url&&!f.path&&f.blob&&!f.trash&&f.id.startsWith('cf_'));
+  if(!localFiles.length)return;
+  toast('info',`☁️ Subiendo ${localFiles.length} archivo(s) local(es) a la nube...`);
+  let ok=0;
+  for(const f of localFiles){
+    try{
+      const blob=f.blob;
+      if(!(blob instanceof Blob))continue;
+      const file=blob instanceof File?blob:new File([blob],f.name,{type:f.type||'application/octet-stream'});
+      await fbUploadFile(file,()=>{});
+      ok++;
+    }catch(e){console.warn('Upload local file:',e);}
+  }
+  if(ok)toast('ok',`✅ ${ok} archivo(s) subido(s) a la nube`);
+}
+
 function syncData(){
   const session=authGetSession();
   if(!session)return;
   if(window._fb&&window._fbUser){
     fbLoadCloudFiles();
+    // Subir archivos locales que no están en la nube
+    setTimeout(fbUploadLocalFiles, 1500);
   } else {
     // Fallback local
     localStorage.setItem('elite_last_sync',new Date().toISOString());
@@ -7059,7 +7119,8 @@ function initAll(){
   // Pre-init cloud silently
   cInitDB().then(()=>cLoadAll()).then(()=>cUpdateStats());
   // Firebase: mostrar estado y cargar archivos de la nube
-  setTimeout(()=>{
+  // Reintenta hasta 8 veces (4 segundos) en caso de dispositivo nuevo donde Firebase tarda en verificar
+  function _initFirebase(attempts){
     const st=document.getElementById('fb-status');
     const dot=document.getElementById('fb-status-dot');
     const txt=document.getElementById('fb-status-txt');
@@ -7068,12 +7129,16 @@ function initAll(){
       if(dot)dot.style.background='#4caf50';
       if(txt)txt.textContent='☁️ Firebase conectado — '+window._fbUser.email;
       fbLoadCloudFiles();
+    } else if(attempts>0){
+      // Firebase aún no verificó — reintentar
+      setTimeout(()=>_initFirebase(attempts-1),500);
     } else {
       if(st){st.style.display='flex';setTimeout(()=>st.style.display='none',4000);}
       if(dot)dot.style.background='#ff9800';
       if(txt)txt.textContent='⚡ Modo local — inicia sesión para la nube real';
     }
-  },1000);
+  }
+  setTimeout(()=>_initFirebase(8),500);
   // Show RAM in system tray title
   if(navigator.deviceMemory)console.log(`RAM: ${navigator.deviceMemory}GB | Cores: ${navigator.hardwareConcurrency}`);
   // Load saved session
